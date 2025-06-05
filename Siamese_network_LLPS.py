@@ -205,95 +205,105 @@ def look_weights(model):
         for j, weight in enumerate(weights):
             print(f"  Weight {j}: {weight.shape}")
 
-def create_esm_base_network(esm_fest_size,
-                        conv_filters1, conv_kernel_size1,
-                        pool_size,
-                        conv_filters2, conv_kernel_size2,
-                        dense1,
-                        dense2):
-    In1 = Input((esm_fest_size,1))
-    x = Conv1D(conv_filters1, kernel_size=conv_kernel_size1, padding='same',activation='relu',
-               activity_regularizer=l1(10e-6),
-               kernel_regularizer=l1(1e-5),
-               bias_regularizer=l1(0.0001))(In1)
-    x= MaxPooling1D(pool_size)(x)
-    x = Dropout(0.2)(x)
-    x = Conv1D(conv_filters2, kernel_size=conv_kernel_size2, padding='same', activation='relu',
-               activity_regularizer=l1(10e-6),
-               kernel_regularizer=l1(1e-5),
-               bias_regularizer=l1(0.0001))(x)
-    x = Dropout(0.2)(x)
-    x = Flatten()(x)
-    x = Dense(dense1, activation='relu',
+def create_base_network(layer_label, input_dim, dense1, dense2):
+    input = Input((input_dim, 1))
+    x = Flatten()(input)
+    x = Dense(dense1, activation='relu', name=layer_label+"dense1",
               activity_regularizer=l1(10e-6),
-              kernel_regularizer=l1(1e-5),
+              kernel_regularizer=l1(0.001),
               bias_regularizer=l1(0.0001))(x)
     x = Dropout(0.2)(x)
-    x = Dense(dense2, activation='relu',
+    x = Dense(dense2, activation='relu', name=layer_label+"dense2",
               activity_regularizer=l1(10e-6),
-              kernel_regularizer=l1(1e-5),
+              kernel_regularizer=l1(0.001),
               bias_regularizer=l1(0.0001))(x)
-    return Model(In1, x)
+    return Model(input, x)
 
-def create_merge_base_network(esm_fest_size,
-                        conv_filters1, conv_kernel_size1,
-                        pool_size,
-                        conv_filters2, conv_kernel_size2,
-                        dense1,
-                        dense2):
+def single_siamese_network(esm_base_network, feat_dim,
+                           train_pairs, train_y, test_pairs, test_y,
+                           indep_pairs, indep_y, epochs, batch_size):
 
-    In1 = Input((esm_fest_size,2))
-    x = Conv1D(conv_filters1, kernel_size=conv_kernel_size1, padding='same',activation='relu',
-               activity_regularizer=l1(10e-6),
-               kernel_regularizer=l1(1e-5),
-               bias_regularizer=l1(0.0001))(In1)
-    x= MaxPooling1D(pool_size)(x)
-    x = Dropout(0.2)(x)
-    x = Conv1D(conv_filters2, kernel_size=conv_kernel_size2, padding='same', activation='relu',
-               activity_regularizer=l1(10e-6),
-               kernel_regularizer=l1(1e-5),
-               bias_regularizer=l1(0.0001))(x)
-    x = Dropout(0.2)(x)
-    x = Flatten()(x)
-    x = Dense(dense1, activation='relu',
-              activity_regularizer=l1(10e-6),
-              kernel_regularizer=l1(1e-5),
-              bias_regularizer=l1(0.0001))(x)
-    x = Dropout(0.2)(x)
-    x = Dense(dense2, activation='relu',
-              activity_regularizer=l1(10e-6),
-              kernel_regularizer=l1(1e-5),
-              bias_regularizer=l1(0.0001))(x)
-    return Model(In1, x)
+    input_esm_a = Input(shape=(feat_dim,), name='feat1_a')
+    input_esm_b = Input(shape=(feat_dim,), name='feat1_b')
 
-def siamese_net_LLPS(model_name, merge_model_h5, base_network, input_shape, esm_train_pairs, train_y,
-                        esm_test_pairs, test_y, esm_indep_pairs, indep_y,
-                        epochs, batch_size):
-    input_a = Input(shape=input_shape)
-    input_b = Input(shape=input_shape)
+    esm_encoded_a = esm_base_network(input_esm_a)
+    esm_encoded_b = esm_base_network(input_esm_b)
 
-    processed_a = base_network(input_a)
-    processed_b = base_network(input_b)
+    distance_esm = Lambda(euclidean_distance, output_shape=eucl_dist_output_shape)(
+        [esm_encoded_a, esm_encoded_b])  # 自定义层计算距离，注意此处API
 
-    distance = Lambda(euclidean_distance,
-                      output_shape=eucl_dist_output_shape)([processed_a, processed_b])
-
-    model = Model([input_a, input_b], distance)
+    model = Model(
+        inputs=[input_esm_a, input_esm_b],
+        outputs=distance_esm)
 
     rms = RMSprop()
     model.compile(loss=contrastive_loss, optimizer=rms, metrics=[accuracy])
 
     checkpoint = EarlyStopping(monitor='val_loss',
-                               min_delta=0,
+                               min_delta=0.0001,
                                patience=7,
-                               verbose=1, mode='auto')
+                               verbose=1,
+                               mode='min',
+                               restore_best_weights=True)
 
-    model.fit([esm_train_pairs[:, 0], esm_train_pairs[:, 1]], train_y,
-              batch_size=batch_size,
-              epochs=epochs,
-              validation_data=([esm_test_pairs[:, 0], esm_test_pairs[:, 1]], test_y), callbacks=[checkpoint], verbose=2)  # 训练
+    history = model.fit([train_pairs[:, 0, :esm_feat_size], train_pairs[:, 1, :esm_feat_size]], train_y,
+                        validation_data=([test_pairs[:, 0, :esm_feat_size], test_pairs[:, 1, :esm_feat_size]],
+                                         test_y),
+                        epochs=epochs,
+                        batch_size=batch_size,
+                        callbacks=[checkpoint],
+                        verbose=2)
 
-    model.save(merge_model_h5)
+def multi_siamese_network(feat1_base_network, feat2_base_network, feat1_size, feat2_size,
+                           train_pairs, train_y, test_pairs, test_y,
+                          indep_pairs, indep_y, epochs, batch_size):
+
+    input_feat1_a = Input(shape=(feat1_size,), name='feat1_a')
+    input_feat1_b = Input(shape=(feat1_size,), name='feat1_b')
+
+    feat1_encoded_a = feat1_base_network(input_feat1_a)
+    feat1_encoded_b = feat1_base_network(input_feat1_b)
+
+    input_feat2_a = Input(shape=(feat2_size,), name='feat2_a')
+    input_feat2_b = Input(shape=(feat2_size,), name='feat2_b')
+
+    feat2_encoded_a = feat2_base_network(input_feat2_a)
+    feat2_encoded_b = feat2_base_network(input_feat2_b)
+
+    distance_feat1 = Lambda(euclidean_distance, output_shape=eucl_dist_output_shape)(
+        [feat1_encoded_a, feat1_encoded_b])
+    distance_feat2 = Lambda(euclidean_distance, output_shape=eucl_dist_output_shape)(
+        [feat2_encoded_a, feat2_encoded_b])
+
+    distance_feat1 = BatchNormalization()(distance_feat1)
+    distance_feat2 = BatchNormalization()(distance_feat2)
+
+    final_distance = DynamicWeightLayer()([distance_feat1, distance_feat2])
+
+    model = Model(
+        inputs=[input_feat1_a, input_feat1_b, input_feat2_a, input_feat2_b],
+        outputs=final_distance
+    )
+
+    rms = RMSprop()
+    model.compile(loss=contrastive_loss, optimizer=rms, metrics=[accuracy])  #
+
+    checkpoint = EarlyStopping(monitor='val_loss',
+                               min_delta=0.0001,
+                               patience=7,
+                               verbose=1,
+                               mode='min',
+                               restore_best_weights=True)
+
+    history = model.fit([train_pairs[:, 0, :feat1_size], train_pairs[:, 1, :feat1_size],
+                         train_pairs[:, 0, feat1_size:], train_pairs[:, 1, feat1_size:]], train_y,
+                        validation_data=([test_pairs[:, 0, :feat1_size], test_pairs[:, 1, :feat1_size],
+                                          test_pairs[:, 0, feat1_size:], test_pairs[:, 1, feat1_size:]],
+                                         test_y),
+                        epochs=epochs,
+                        batch_size=batch_size,
+                        callbacks=[checkpoint],
+                        verbose=2)
 
     train_y_pred = model.predict([esm_train_pairs[:, 0], esm_train_pairs[:, 1]])
     train_acc,train_auc,train_mcc = compute_acc_auc_mcc(train_y, train_y_pred)
