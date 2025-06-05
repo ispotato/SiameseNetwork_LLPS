@@ -14,6 +14,24 @@ from sklearn import metrics
 from sklearn.model_selection import KFold
 from keras.callbacks import EarlyStopping
 
+class DynamicWeightLayer(Layer):
+    def __init__(self, **kwargs):
+        super(DynamicWeightLayer, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        # 初始化可训练权重参数
+        self.w_esm = self.add_weight(name='w_esm', shape=(1,), initializer='ones', trainable=True)
+        self.w_ppi = self.add_weight(name='w_ppi', shape=(1,), initializer='ones', trainable=True)
+        super(DynamicWeightLayer, self).build(input_shape)
+
+    def call(self, inputs):
+        distance_esm, distance_ppi = inputs
+        # 动态softmax权重（归一化）
+        total = tf.abs(self.w_esm) + tf.abs(self.w_ppi) + 1e-6
+        weight_esm = tf.abs(self.w_esm) / total
+        weight_ppi = tf.abs(self.w_ppi) / total
+        return weight_esm * distance_esm + weight_ppi * distance_ppi
+
 def load_acc2label_ht(acc2label_xls):
     data = np.loadtxt(acc2label_xls, delimiter='\t', dtype=str)
     access_label_ht = {}
@@ -332,7 +350,7 @@ result_root=root+"/esm+ppi-param"
 model_name_arry=["uniprot_human_t6-8M_pt","uniprot_human_t12-35M_pt","uniprot_human_t30_pt",
                  "uniprot_human_t33_pt"]
 t_length_arry=[6,12,30,33]
-esm_feat_arry=[320,480,640,1280]
+esm_feat_arry=[320,480,640]
 esm_index=2
 
 esm_name=model_name_arry[esm_index]
@@ -369,44 +387,35 @@ indep_X1 = indep_esm_X.reshape(-1, esm_feat_size, 1).astype('float32')
 indep_X2 = indep_ppi_X.reshape(-1, esm_feat_size, 1).astype('float32')
 indep_X = np.concatenate((indep_X1, indep_X2), axis=-1)
 
-cnn_param = {'conv_filters':5 , 'conv_kernel': 4, 'pool_size': 3, 'dense1':32, 'dense2':4}
+cnn1 = {'dense1':32, 'dense2':8}
 
-conv_filters1=cnn_param['conv_filters']
-conv_kernel1=cnn_param['conv_kernel']
-pool_size=cnn_param['pool_size']
-dense1=cnn_param['dense1']
-dense2 = cnn_param['dense2']
+indep_pairs, y_pairs_indep = get_pair_dataset(indep_X, indep_y, num_classes)
 
-esm_base_network = create_esm_base_network(ppi_feat_size,conv_filters1, conv_kernel1,
-                                   pool_size,conv_filters1, conv_kernel1,dense1,dense2)
+dense1=cnn1['dense1']
+dense2 = cnn1['dense2']
 
-merge_base_network = create_merge_base_network(ppi_feat_size, conv_filters1, conv_kernel1,
-                                           pool_size, conv_filters1, conv_kernel1, dense1, dense2)
+esm_base_network1 = create_base_network("esm",esm_feat_size,dense1, dense2)
+ppi_base_network1 = create_base_network("ppi",ppi_feat_size,dense1, dense2)
+
+esm_base_network2 = create_base_network("esm", esm_feat_size, dense1, dense2)
+ppi_base_network2 = create_base_network("ppi", ppi_feat_size, dense1, dense2)
 
 kf = KFold(n_splits=10, shuffle=True, random_state=42)
-kf = kf.split(esm_X)
+kf = kf.split(X)
 for i, (train_fold, validate_fold) in enumerate(kf):
+    train_pairs, y_pairs_train=\
+        get_pair_dataset(X[train_fold], y[train_fold], num_classes)
 
-    X_pairs_train, y_pairs_train=get_pair_dataset(X[train_fold], y[train_fold], num_classes)
-    X_pairs_test, y_pairs_test=get_pair_dataset(X[validate_fold], y[validate_fold], num_classes)
-    X_pairs_indep, y_pairs_indep=get_pair_dataset(indep_X, indep_y, num_classes)
+    test_pairs, y_pairs_test = \
+        get_pair_dataset(X[validate_fold], y[validate_fold], num_classes)
 
-    esm_pairs_train, y_pairs_train = get_pair_dataset(esm_X[train_fold], y[train_fold], num_classes)
-    esm_pairs_test, y_pairs_test = get_pair_dataset(esm_X[validate_fold], y[validate_fold], num_classes)
-    esm_pairs_indep, y_pairs_indep = get_pair_dataset(indep_X1, indep_y, num_classes)
+    single_siamese_network(esm_base_network1, esm_feat_size, train_pairs, y_pairs_train,
+                    test_pairs, y_pairs_test, indep_pairs, y_pairs_indep, epochs, batch_size)
 
-    esm_model_h5 = result_root + "/snLLPS.h5"
+    single_siamese_network(ppi_base_network1, ppi_feat_size,train_pairs,y_pairs_train,test_pairs,
+                           y_pairs_test, indep_pairs, y_pairs_indep, epochs, batch_size)
 
-    esm_model, esm_train_acc, esm_train_auc, esm_train_mcc, esm_test_acc, esm_test_auc, esm_test_mcc, \
-    esm_indep_acc, esm_indep_auc, esm_indep_mcc, \
-    esm_train_err_index_arry, esm_test_err_index_arry, esm_indep_err_index_arry\
-        = siamese_net_LLPS("esm-only",esm_model_h5, esm_base_network, esm_input_shape,
-                    esm_pairs_train, y_pairs_train, esm_pairs_test, y_pairs_test,
-                    esm_pairs_indep, y_pairs_indep, epochs, batch_size)
+    multi_siamese_network(esm_base_network2, ppi_base_network2, esm_feat_size,ppi_feat_size,train_pairs, y_pairs_train,
+                         test_pairs, y_pairs_test, indep_pairs, y_pairs_indep, epochs, batch_size)
 
-    merge_model_h5 = result_root + "/mssnLLPS.h5"
-    merge_model, train_acc, train_auc, train_mcc, test_acc, test_auc, test_mcc, indep_acc, indep_auc, indep_mcc, \
-    train_err_index_arry, test_err_index_arry, indep_err_index_arry\
-         = siamese_net_LLPS("multi_channel",merge_model_h5, merge_base_network, merge_input_shape,
-                                  X_pairs_train, y_pairs_train, X_pairs_test, y_pairs_test,
-                                  X_pairs_indep, y_pairs_indep, epochs, batch_size)
+
